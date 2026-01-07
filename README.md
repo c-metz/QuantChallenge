@@ -1,3 +1,54 @@
+# FlexPower Quant Challenge - Complete Solutions
+
+
+
+This repository summarizes my work on the FlexPower quant challenge with extensions. The focus is on building a practical, robust approach to identifying profitable day-ahead (DA) to intraday (ID) opportunities, then in making the results accessible via a dashboard.
+
+### What was completed
+- **Quant Challenge Tasks 1 & 2**
+  - Implemented and delivered the required solutions except 2.6.
+  - For challenge 2.6 about the BESS, please refer to repo [BESS Optimizer](https://github.com/c-metz/bess-optimizer)
+
+- **Additional work (adapted from other challenges, mostly OpsData)**
+  - **Terminal PnL reporter**: lightweight reporting of strategy performance and key metrics.
+  - **Interactive Streamlit dashboard**: exploratory analysis and visual monitoring of results.
+
+### Key result
+A simple machine learning approach is chosen. An XGBoost model is retrained every day on recent data to make predictions about what trades to make. XGBoost is chosen because of its fast training and inference even for many thousands of features, as well as robust classification skills. The achieved PnL for this approach stands at 12.8m EUR, the win rate at 62.8%, avg PnL per trade at 451.8 EUR. Two advantages of XGBost are its explainability, as well as the possibility to steer risk appetite via its classification probability - more in the next section.
+
+### Modeling approach
+Instead of point forecasting, a classification approach is used:
+- Output: classification probability between 0 and 1 converted to 0/1 decision signal (i.e., take trade vs. do not take trade)
+- Motivation: reduce complexity by making this a binary problem -> directly optimize for decision and reduce sensitivity to noisy price-level predictions.
+- Importantly, classification models like XGBoost return a probability for classification -> this allows to choose a threshold starting from which one wants to trust the model. I.e., we can steer risk appetite by setting this threshold.
+
+## Next improvements
+- **More data**
+  - Weather, load, spot prices, market projections/forecasts, and additional fundamental drivers.
+- **More advanced model families**
+  - Hyperparameter optimizaton of XGBoost, other tree-based models, deep neural networks, sequence models (LSTM/GRU), and model ensembles of all those models.
+
+## Tooling note
+For visualization, dashboards, and implementation sanity checks, I used GitHub Copilot in VS Code (primarily Claude Sonnet 4.5 via ask/agentic mode) and cross-checked with OpenAI's Codex. I deliberately avoided relying on AI for critical modeling logic like feature/label design because LLMs can miss subtle time-series leakage risks, such as using intraday information from the future to make a forecast in the present.
+
+## Guide
+
+If you want to go through task 2 step by step, please refer to task2_analysis.ipynb.
+
+
+**Quick Start:**
+```
+pip install -r requirements.txt
+python convert_trades.py       # Load 2021 trades
+python task1_api.py            # API at localhost:8000
+python task3_report.py strategy_ml_daily 2021-06-15  # Terminal report - insert YYYY-MM-DD of interest at the end
+streamlit run task4_dashboard.py   # Dashboard at localhost:8501
+```
+
+
+
+
+# ORIGNAL README
 # FlexPower Quant Challenge
 
 * [Background](#background)
