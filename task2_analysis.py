@@ -161,21 +161,49 @@ def run_strategy(
 
 def run_ml_strategy(
     df: pd.DataFrame,
-    position_mw: float = 100.0,
+    max_position_mw: float = 100.0,
     min_train_days: int = 30,
-    long_threshold: float = 0.55,
-    short_threshold: float = 0.45,
+    long_threshold: float = 0.90,
+    short_threshold: float = 0.10,
 ):
     """Daily-retrained XGBoost strategy with 11:00 cutoff for next-day trading.
     
+    LEAKAGE PREVENTION:
+    -------------------
     Each day D at 11:00, train model on data up to D 11:00 (included).
     Then predict for ALL hours of day D+1 (next day).
     
+    This prevents data leakage because:
+    1. Training cutoff is at D 11:00 - we only use data available at decision time
+    2. features are computed fresh each day inside the training loop
+    3. Historical features (lags, rolling stats) are computed only from training data
+    4. Hour-of-day statistics are computed only from training data
+    5. For test data (D+1), we use last known rolling values from training cutoff
+    6. Lagged features for D+1 correctly reference past data (D-lag days)
+    
+    FEATURE CATEGORIES:
+    -------------------
     Only future info available for D+1:
     - Temporal features: hour, day_of_week, is_weekend, month, day_of_year
-    - DA renewable forecasts: wind_da, pv_da, total_renewable_da
+    - DA renewable forecasts: wind_da, pv_da, total_renewable_da (known day-ahead)
     
-    Historical features are computed from data up to D 11:00 only.
+    Historical features computed from data up to D 11:00 only:
+    - Price lags (1d, 2d, 7d): da_price, id_price, spread
+    - Renewable lags (1d, 2d, 7d): total_renewable_da
+    - Rolling statistics (24h window): mean, std of prices and spreads
+    - Hour-of-day statistics: computed from training data only
+    
+    PNL-WEIGHTED TRAINING:
+    ----------------------
+    Sample weights = spread_magnitude × time_decay
+    - Spread weights: prioritize getting high-impact predictions right
+    - Time weights: favor recent data (exponential decay)
+    
+    CONFIDENCE-BASED POSITION SIZING:
+    ---------------------------------
+    Position size scales linearly with prediction confidence:
+    - Long: position = (prob - 0.90) / 0.10 × max_position_mw
+    - Short: position = (0.10 - prob) / 0.10 × max_position_mw
     
     Returns (summary dict, results DataFrame, daily PnL Series).
     """
@@ -187,17 +215,23 @@ def run_ml_strategy(
     df_ml['hour'] = df_ml['timestamp'].dt.hour
     df_ml['minute'] = df_ml['timestamp'].dt.minute
     
-    # Price spread target
+    # Price spread target: ID - DA (positive = ID higher than DA)
     id_price_col = 'id_price_h'
     df_ml['price_spread'] = df_ml[id_price_col] - df_ml['da_price']
     
+    # =========================================================================
+    # FEATURE DEFINITIONS
+    # =========================================================================
+    
     # Features that are KNOWN for next day (D+1) when making decision on day D at 11:00
+    # These are either temporal (deterministic) or DA forecasts (published day-ahead)
     future_known_features = [
         'hour', 'day_of_week', 'is_weekend', 'month', 'day_of_year',
         'total_renewable_da', 'wind_da', 'pv_da'
     ]
     
     # Features computed from HISTORICAL data only (up to D 11:00)
+    # These are recomputed each day to prevent leakage
     historical_features = [
         'da_price_lag_1d', 'id_price_lag_1d', 'spread_lag_1d', 'renewable_lag_1d',
         'da_price_lag_2d', 'id_price_lag_2d', 'spread_lag_2d', 'renewable_lag_2d',
@@ -215,11 +249,19 @@ def run_ml_strategy(
     # Initialize results storage
     all_predictions = []
     
+    # =========================================================================
+    # DAILY RETRAINING LOOP
+    # =========================================================================
+    
     for day_idx in range(min_train_days, len(unique_dates) - 1):
         current_date = unique_dates[day_idx]  # Day D
         next_date = unique_dates[day_idx + 1]  # Day D+1 (prediction target)
         
-        # === STEP 1: Get training data up to Day D at 11:00 (included) ===
+        # =====================================================================
+        # STEP 1: Get training data up to Day D at 11:00 (included)
+        # This is the LEAKAGE PREVENTION cutoff where we only use data available
+        # at the time we would likke to make the trading decision
+        # =====================================================================
         cutoff_time = pd.Timestamp(current_date) + pd.Timedelta(hours=11)
         train_mask = df_ml['timestamp'] <= cutoff_time
         train_raw = df_ml[train_mask].copy()
@@ -227,17 +269,21 @@ def run_ml_strategy(
         if len(train_raw) < 100:
             continue
         
-        # === STEP 2: Compute features on training data ===
-        # Temporal features
+        # =====================================================================
+        # STEP 2: Compute features on training data FRESH each day
+        # This prevents leakage from pre-computed features
+        # =====================================================================
+        
+        # Temporal features (deterministic, no leakage risk)
         train_raw['day_of_week'] = train_raw['timestamp'].dt.dayofweek
         train_raw['is_weekend'] = (train_raw['day_of_week'] >= 5).astype(int)
         train_raw['month'] = train_raw['timestamp'].dt.month
         train_raw['day_of_year'] = train_raw['timestamp'].dt.dayofyear
         
-        # Renewable features
+        # Renewable features (DA forecasts, known day-ahead unlike the ID forfecast)
         train_raw['total_renewable_da'] = train_raw['wind_da'] + train_raw['pv_da']
         
-        # Lagged features (1, 2, 7 days)
+        # Lagged features (1, 2, 7 days) - computed from training data only
         for lag in [1, 2, 7]:
             lag_periods = lag * 96  # 96 quarter-hours per day
             train_raw[f'da_price_lag_{lag}d'] = train_raw['da_price'].shift(lag_periods)
@@ -245,15 +291,16 @@ def run_ml_strategy(
             train_raw[f'spread_lag_{lag}d'] = train_raw['price_spread'].shift(lag_periods)
             train_raw[f'renewable_lag_{lag}d'] = train_raw['total_renewable_da'].shift(lag_periods)
         
-        # Rolling statistics (24h window)
-        window = 96
+        # Rolling statistics (24h window) - computed from training data only
+        window = 96  # 24 hours * 4 quarter-hours
         train_raw['da_price_mean_24h'] = train_raw['da_price'].rolling(window=window, min_periods=1).mean()
         train_raw['da_price_std_24h'] = train_raw['da_price'].rolling(window=window, min_periods=1).std()
         train_raw['id_price_mean_24h'] = train_raw[id_price_col].rolling(window=window, min_periods=1).mean()
         train_raw['spread_mean_24h'] = train_raw['price_spread'].rolling(window=window, min_periods=1).mean()
         train_raw['renewable_mean_24h'] = train_raw['total_renewable_da'].rolling(window=window, min_periods=1).mean()
         
-        # Hour-of-day statistics (computed from historical data only)
+        # Hour-of-day statistics - computed from HISTORICAL data only
+        # This captures typical patterns by hour without using future data
         hourly_stats_train = train_raw.groupby('hour').agg({
             'da_price': 'mean',
             'price_spread': 'mean'
@@ -262,49 +309,72 @@ def run_ml_strategy(
         train_raw = train_raw.merge(hourly_stats_train, on='hour', how='left', suffixes=('', '_drop'))
         train_raw = train_raw.loc[:, ~train_raw.columns.str.endswith('_drop')]
         
-        # Drop NaN rows
+        # Drop NaN rows (from lag computation)
         train_clean = train_raw.dropna(subset=all_features)
         
         if len(train_clean) < 100:
             continue
         
-        # === STEP 3: Prepare training data ===
+        # =====================================================================
+        # STEP 3: Prepare training data with PnL-weighted samples
+        # =====================================================================
         X_train = train_clean[all_features]
         y_train = (train_clean['price_spread'] > 0).astype(int)
         
-        # Time weights: favor recent data
+        # === PNL-WEIGHTED SAMPLE WEIGHTS ===
+        # Weight each sample by the absolute spread magnitude
+        # This makes the model prioritize getting high-impact predictions right
+        spread_weights = np.abs(train_clean['price_spread'].values)
+        # Normalize to prevent numerical issues (mean weight = 1)
+        spread_weights = spread_weights / (spread_weights.mean() + 1e-10)
+        
+        # Time weights: favor recent data (exponential decay)
         n_samples = len(train_clean)
         decay = 0.01
         time_weights = np.exp(decay * np.arange(n_samples))
         time_weights = 0.5 + 0.5 * (time_weights - time_weights.min()) / (time_weights.max() - time_weights.min() + 1e-10)
         
-        # === STEP 4: Train model ===
+        # Combine: PnL impact × time recency
+        combined_weights = spread_weights * time_weights
+        # Renormalize
+        combined_weights = combined_weights / (combined_weights.mean() + 1e-10)
+        
+        # =====================================================================
+        # STEP 4: Train model with PnL-weighted samples
+        # =====================================================================
         model = XGBClassifier(
-            n_estimators=100,
-            max_depth=5,
+            n_estimators=200,
+            max_depth=9,
             learning_rate=0.1,
             random_state=42,
             eval_metric='logloss'
         )
-        model.fit(X_train, y_train, sample_weight=time_weights)
+        model.fit(X_train, y_train, sample_weight=combined_weights)
         
-        # === STEP 5: Prepare test data for Day D+1 ===
+        # =====================================================================
+        # STEP 5: Prepare test data for Day D+1
+        # Only use information that would be available at decision time
+        # =====================================================================
         test_raw = df_ml[df_ml['date'] == next_date].copy()
         
         if len(test_raw) == 0:
             continue
         
-        # For D+1, we only know: temporal features + DA renewable forecasts
+        # Temporal features for D+1 (deterministic, always known)
         test_raw['day_of_week'] = test_raw['timestamp'].dt.dayofweek
         test_raw['is_weekend'] = (test_raw['day_of_week'] >= 5).astype(int)
         test_raw['month'] = test_raw['timestamp'].dt.month
         test_raw['day_of_year'] = test_raw['timestamp'].dt.dayofyear
+        
+        # DA renewable forecasts for D+1 (known day-ahead)
         test_raw['total_renewable_da'] = test_raw['wind_da'] + test_raw['pv_da']
         
         # Create combined dataset for lag computation
+        # This allows us to compute lags that span from training to test
         combined = pd.concat([train_raw, test_raw], ignore_index=True).sort_values('timestamp')
         
         # Recompute lagged features on combined data
+        # For D+1, the lags will reference historical data (D-lag days)
         for lag in [1, 2, 7]:
             lag_periods = lag * 96
             combined[f'da_price_lag_{lag}d'] = combined['da_price'].shift(lag_periods)
@@ -312,7 +382,8 @@ def run_ml_strategy(
             combined[f'spread_lag_{lag}d'] = combined['price_spread'].shift(lag_periods)
             combined[f'renewable_lag_{lag}d'] = combined['total_renewable_da'].shift(lag_periods)
         
-        # Get last known rolling values from training data
+        # Get last known rolling values from training data (at cutoff time)
+        # These are the most recent rolling stats we would have at decision time
         last_rolling_values = train_raw.iloc[-1][['da_price_mean_24h', 'da_price_std_24h', 
                                                    'id_price_mean_24h', 'spread_mean_24h', 
                                                    'renewable_mean_24h']]
@@ -320,12 +391,12 @@ def run_ml_strategy(
         # Extract D+1 rows from combined
         test_combined = combined[combined['date'] == next_date].copy()
         
-        # Fill rolling stats with last known values
+        # Fill rolling stats with last known values (from training cutoff)
         for col in ['da_price_mean_24h', 'da_price_std_24h', 'id_price_mean_24h', 
                     'spread_mean_24h', 'renewable_mean_24h']:
             test_combined[col] = last_rolling_values[col]
         
-        # Hour-of-day stats from training data
+        # Hour-of-day stats from training data (no future leakage)
         test_combined = test_combined.drop(columns=['da_price_hour_mean', 'spread_hour_mean'], errors='ignore')
         test_combined = test_combined.merge(hourly_stats_train, on='hour', how='left')
         
@@ -336,25 +407,52 @@ def run_ml_strategy(
             elif test_combined[feat].isna().any():
                 test_combined[feat] = test_combined[feat].fillna(X_train[feat].median())
         
-        # === STEP 6: Make predictions for D+1 ===
+        # =====================================================================
+        # STEP 6: Make predictions with CONFIDENCE-BASED POSITION SIZING
+        # =====================================================================
         X_test = test_combined[all_features]
         
         probs = model.predict_proba(X_test)[:, 1]
         
-        # Trading signals
-        test_combined['signal'] = 0
-        test_combined.loc[probs > long_threshold, 'signal'] = 1
-        test_combined.loc[probs < short_threshold, 'signal'] = -1
-        test_combined['prob'] = probs
+        # === CONFIDENCE-BASED POSITION SIZING ===
+        # Position size scales linearly with how confident the model is
+        # For long: prob 0.90 -> 0 MW, prob 1.0 -> max_position_mw
+        # For short: prob 0.10 -> 0 MW, prob 0.0 -> max_position_mw
         
-        # Calculate PnL
-        test_combined['pnl'] = test_combined['signal'] * test_combined['price_spread'] * position_mw
+        # Initialize arrays
+        signals = np.zeros(len(probs))
+        position_sizes = np.zeros(len(probs))
+        
+        # Long positions: scale from 0 MW at threshold to max MW at probability = 1.0
+        long_mask = probs > long_threshold
+        if long_mask.any():
+            # Confidence = how far above threshold (0 to 1 scale)
+            long_confidence = (probs[long_mask] - long_threshold) / (1.0 - long_threshold)
+            signals[long_mask] = 1
+            position_sizes[long_mask] = long_confidence * max_position_mw
+        
+        # Short positions: scale from 0 MW at threshold to max MW at probability = 0.0
+        short_mask = probs < short_threshold
+        if short_mask.any():
+            # Confidence = how far below threshold (0 to 1 scale)
+            short_confidence = (short_threshold - probs[short_mask]) / short_threshold
+            signals[short_mask] = -1
+            position_sizes[short_mask] = short_confidence * max_position_mw
+        
+        test_combined['signal'] = signals
+        test_combined['prob'] = probs
+        test_combined['position_mw'] = position_sizes
+        
+        # Calculate PnL: signal * spread * position_size (variable per prediction)
+        test_combined['pnl'] = test_combined['signal'] * test_combined['price_spread'] * test_combined['position_mw']
         
         # Store results
         all_predictions.append(test_combined[['timestamp', 'date', 'hour', 'price_spread', 
-                                               'signal', 'prob', 'pnl']])
+                                               'signal', 'prob', 'position_mw', 'pnl']])
     
-    # === COMBINE ALL RESULTS ===
+    # =========================================================================
+    # COMBINE ALL RESULTS
+    # =========================================================================
     if not all_predictions:
         return {"error": "No predictions generated"}, pd.DataFrame(), pd.Series(dtype=float)
     
@@ -367,11 +465,12 @@ def run_ml_strategy(
     winning_trades = (trades_df['pnl'] > 0).sum() if n_trades > 0 else 0
     losing_trades = (trades_df['pnl'] < 0).sum() if n_trades > 0 else 0
     win_rate = winning_trades / n_trades if n_trades > 0 else 0
+    avg_position = trades_df['position_mw'].mean() if n_trades > 0 else 0
     
     daily_pnl = results_df.groupby('date')['pnl'].sum()
     
     summary = {
-        "position_mw": position_mw,
+        "max_position_mw": max_position_mw,
         "min_train_days": min_train_days,
         "long_threshold": long_threshold,
         "short_threshold": short_threshold,
@@ -380,6 +479,7 @@ def run_ml_strategy(
         "winning_trades": int(winning_trades),
         "losing_trades": int(losing_trades),
         "win_rate": float(win_rate),
+        "avg_position_mw": float(avg_position),
         "avg_pnl_per_trade": float(total_pnl / n_trades) if n_trades > 0 else 0.0,
         "market_coverage": float(n_trades / len(results_df)) if len(results_df) > 0 else 0.0,
         "daily_mean": float(daily_pnl.mean()),
