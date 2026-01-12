@@ -14,13 +14,22 @@ This repository summarizes my work on the FlexPower quant challenge with extensi
   - **Interactive Streamlit dashboard**: exploratory analysis and visual monitoring of results.
 
 ### Key result
-A simple machine learning approach is chosen. An XGBoost model is retrained every day on recent data to make predictions about what trades to make. XGBoost is chosen because of its fast training and inference even for many thousands of features, as well as robust classification skills. The achieved PnL for this approach stands at 12.8m EUR, the win rate at 62.8%, avg PnL per trade at 451.8 EUR. Two advantages of XGBost are its explainability, as well as the possibility to steer risk appetite via its classification probability - more in the next section.
+A simple machine learning approach is chosen. An XGBoost model is retrained every day on recent data to make predictions about what trades to make. Total PnL after 11 months (1st month of data used for training) is ca. 1.7m EUR.
 
 ### Modeling approach
 Instead of point forecasting, a classification approach is used:
-- Output: classification probability between 0 and 1 converted to 0/1 decision signal (i.e., take trade vs. do not take trade)
+- Output: classification probability between 0 and 1 converted to 0/1 decision signal (i.e., take trade vs. do not take trade).
 - Motivation: reduce complexity by making this a binary problem -> directly optimize for decision and reduce sensitivity to noisy price-level predictions.
 - Importantly, classification models like XGBoost return a probability for classification -> this allows to choose a threshold starting from which one wants to trust the model. I.e., we can steer risk appetite by setting this threshold.
+-  XGBoost is chosen due to its explainability (feature importance) and fast training and inference.
+
+
+### Strategy approach
+3 strategies are used:
+1. daily retraining of XGBoost with simple classification as objectve function (Area Under Curve as criterion). -100, 0 or 100 MW positions can be taken.
+2. same as 1, but with logloss weighted by PnL result of classification used as objective function -> PnL is what we care about, so optimize for that.
+3. same as 2, but with "bet sizing" i.e. position size is a function of classification score returned by XGBoost -> confidence in model output is reflected in ize of positions.
+
 
 ## Next improvements
 - **More data**
@@ -33,7 +42,7 @@ For visualization, dashboards, and implementation sanity checks, I used GitHub C
 
 ## Guide
 
-If you want to go through task 2 step by step, please refer to task2_analysis.ipynb.
+If you want to go through task 2 step by step with comments about the rationale, please refer to task2_analysis.ipynb.
 
 
 **Quick Start:**
@@ -41,7 +50,7 @@ If you want to go through task 2 step by step, please refer to task2_analysis.ip
 pip install -r requirements.txt
 python convert_trades.py       # Load 2021 trades
 python task1_api.py            # API at localhost:8000
-python task3_report.py strategy_ml_daily 2021-06-15  # Terminal report - insert YYYY-MM-DD of interest at the end
+python task3_report.py strategy_3_pnl_confidence 2021-06-15   # Terminal report - insert YYYY-MM-DD of interest at the end
 streamlit run task4_dashboard.py   # Dashboard at localhost:8501
 ```
 
